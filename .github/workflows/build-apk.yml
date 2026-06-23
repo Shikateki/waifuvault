@@ -1,0 +1,60 @@
+name: Build WaifuVault APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: "3.24.5"
+          channel: "stable"
+
+      - name: Create Android project files
+        run: flutter create --platforms=android --project-name waifuvault .
+
+      - name: Install dependencies
+        run: flutter pub get
+
+      - name: Set app display name and storage permissions
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          manifest = Path("android/app/src/main/AndroidManifest.xml")
+          text = manifest.read_text()
+          text = text.replace('android:label="waifuvault"', 'android:label="WaifuVault"')
+          perms = "\n".join([
+              '    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32" />',
+              '    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="28" />',
+              '    <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />',
+              '    <uses-permission android:name="android.permission.READ_MEDIA_VIDEO" />',
+              '    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />',
+          ]) + "\n"
+          if 'android.permission.MANAGE_EXTERNAL_STORAGE' not in text:
+              text = text.replace('<application', perms + '    <application')
+          manifest.write_text(text)
+          PY
+
+      - name: Generate branding assets
+        run: |
+          dart run flutter_launcher_icons
+          dart run flutter_native_splash:create
+
+      - name: Build APK
+        run: flutter build apk --release
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: WaifuVault-APK
+          path: build/app/outputs/flutter-apk/app-release.apk
