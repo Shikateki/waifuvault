@@ -359,7 +359,7 @@ class VaultStore extends ChangeNotifier {
 
   Map<String, dynamic> backupPayload() => {
         'app': 'WaifuVault',
-        'version': '2.0.7 V9.4.2 Voice Ultra Performance Patch',
+        'version': '2.0.9 V9.4.4 Static Waveform Performance Fix',
         'exportedAt': DateTime.now().toIso8601String(),
         'itemCount': _items.length,
         'items': _items.map((e) => e.toJson()).toList(),
@@ -1164,21 +1164,23 @@ class VoiceScreen extends StatefulWidget {
 }
 
 class _VoiceScreenState extends State<VoiceScreen> {
+  static const int _waveformBarCount = 64;
+
   final AudioPlayer _player = AudioPlayer();
   final List<VoiceTrack> _tracks = [];
-  final List<double> _spectrum = List<double>.filled(40, .28);
+  final Map<String, List<double>> _waveformCache = {};
+  late final List<double> _emptyWaveform = _buildDeterministicWaveform('empty_voice_waveform', _waveformBarCount);
+  final ValueNotifier<Duration> _positionNotifier = ValueNotifier<Duration>(Duration.zero);
 
   StreamSubscription<Duration>? _durationSub;
   StreamSubscription<Duration>? _positionSub;
   StreamSubscription<PlayerState>? _stateSub;
   StreamSubscription<void>? _completeSub;
-  Timer? _spectrumTimer;
   int _lastPositionUiMs = 0;
 
   bool _loading = true;
   bool _playing = false;
   int _index = 0;
-  int _tick = 0;
   Duration _duration = Duration.zero;
   Duration _position = Duration.zero;
 
@@ -1194,38 +1196,30 @@ class _VoiceScreenState extends State<VoiceScreen> {
     _positionSub = _player.onPositionChanged.listen((position) {
       if (!mounted) return;
       final now = DateTime.now().millisecondsSinceEpoch;
-      // V9.4.2: throttle update progress lebih jauh biar UI tidak rebuild terlalu sering.
-      if (now - _lastPositionUiMs < 520 && position < _duration) {
+      // V9.4.4: throttle progress to ~15 FPS and update only lightweight listeners.
+      if (now - _lastPositionUiMs < 66 && position < _duration) {
         _position = position;
         return;
       }
       _lastPositionUiMs = now;
-      setState(() => _position = position);
+      _position = position;
+      _positionNotifier.value = position;
     });
     _stateSub = _player.onPlayerStateChanged.listen((state) {
       if (!mounted) return;
       setState(() => _playing = state == PlayerState.playing);
     });
     _completeSub = _player.onPlayerComplete.listen((_) => _next());
-    _spectrumTimer = Timer.periodic(const Duration(milliseconds: 240), (_) {
-      if (!mounted) return;
-      if (_playing) {
-        setState(() {
-          _tick++;
-          _updateSpectrum();
-        });
-      }
-    });
     _scanTracks();
   }
 
   @override
   void dispose() {
-    _spectrumTimer?.cancel();
     _durationSub?.cancel();
     _positionSub?.cancel();
     _stateSub?.cancel();
     _completeSub?.cancel();
+    _positionNotifier.dispose();
     _player.dispose();
     super.dispose();
   }
@@ -1240,30 +1234,34 @@ class _VoiceScreenState extends State<VoiceScreen> {
         ..addAll(result);
       if (_index >= _tracks.length) _index = 0;
       _loading = false;
-      _updateSpectrum(forceIdle: true);
+      for (final track in _tracks) {
+        _waveformFor(track);
+      }
     });
   }
 
-  void _updateSpectrum({bool forceIdle = false}) {
-    final trackHash = (_current?.path.hashCode ?? 17).abs();
-    final t = forceIdle ? 0.0 : (_position.inMilliseconds / 1000.0) + (_tick * .065);
-    for (int i = 0; i < _spectrum.length; i++) {
-      final zone = i / math.max(1, _spectrum.length - 1);
-      final bass = math.sin(t * (2.0 + (trackHash % 7) * .03) + i * .42) * .5 + .5;
-      final mid = math.sin(t * (4.4 + (trackHash % 11) * .02) + i * .88 + 1.2) * .5 + .5;
-      final high = math.sin(t * (7.6 + (trackHash % 13) * .02) + i * 1.37 + 2.4) * .5 + .5;
-      final pulse = math.sin(t * 1.35 + zone * math.pi * 2) * .5 + .5;
-      double value;
-      if (i < _spectrum.length * .28) {
-        value = bass * .72 + pulse * .28;
-      } else if (i < _spectrum.length * .72) {
-        value = mid * .68 + bass * .18 + pulse * .14;
-      } else {
-        value = high * .62 + mid * .26 + pulse * .12;
-      }
-      if (!_playing && !forceIdle) value *= .42;
-      _spectrum[i] = (.18 + value * .82).clamp(.14, 1.0).toDouble();
+  List<double> _waveformFor(VoiceTrack track) {
+    return _waveformCache.putIfAbsent(track.path, () => _buildDeterministicWaveform(track.path, _waveformBarCount));
+  }
+
+  static List<double> _buildDeterministicWaveform(String key, int count) {
+    // Lightweight cached fallback: avoids decoding/scanning audio while playback is active.
+    var seed = key.hashCode & 0x7fffffff;
+    double nextNoise() {
+      seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+      return seed / 0x7fffffff;
     }
+
+    var previous = .42 + nextNoise() * .18;
+    return List<double>.generate(count, (i) {
+      final t = i / math.max(1, count - 1);
+      final envelope = math.sin(t * math.pi).clamp(0.0, 1.0);
+      final low = math.sin((i * .41) + nextNoise() * .35) * .5 + .5;
+      final mid = math.sin((i * .17) + 1.8 + nextNoise() * .45) * .5 + .5;
+      final target = (.22 + envelope * .46 + low * .22 + mid * .16 + nextNoise() * .18).clamp(.18, 1.0);
+      previous = (previous * .62 + target * .38).clamp(.16, .96);
+      return previous;
+    });
   }
 
   Future<void> _playIndex(int index) async {
@@ -1278,7 +1276,8 @@ class _VoiceScreenState extends State<VoiceScreen> {
         _index = safeIndex;
         _position = Duration.zero;
         _duration = Duration.zero;
-        _updateSpectrum(forceIdle: true);
+        _positionNotifier.value = Duration.zero;
+        _waveformFor(track);
       });
       await _player.stop();
       await _player.play(DeviceFileSource(track.path));
@@ -1333,7 +1332,7 @@ class _VoiceScreenState extends State<VoiceScreen> {
     final avatar = mediaPreviewFile(latest);
     final current = _current;
     final progressMax = math.max(1, _duration.inMilliseconds).toDouble();
-    final progress = _position.inMilliseconds.clamp(0, math.max(1, _duration.inMilliseconds)).toDouble();
+    final waveform = current == null ? _emptyWaveform : _waveformFor(current);
 
     return NeonBackground(
       child: SafeArea(
@@ -1385,23 +1384,33 @@ class _VoiceScreenState extends State<VoiceScreen> {
                     ],
                   ),
                   const SizedBox(height: 12),
-                  RepaintBoundary(child: SpectrumVisualizer(values: _spectrum, playing: _playing)),
-                  const SizedBox(height: 10),
-                  SliderTheme(
-                    data: SliderTheme.of(context).copyWith(trackHeight: 3, thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 5)),
-                    child: Slider(
-                      min: 0,
-                      max: progressMax,
-                      value: progress.clamp(0, progressMax).toDouble(),
-                      activeColor: kPink,
-                      inactiveColor: Colors.white.withOpacity(.12),
-                      onChanged: _duration == Duration.zero ? null : _seek,
-                    ),
+                  ValueListenableBuilder<Duration>(
+                    valueListenable: _positionNotifier,
+                    builder: (context, position, _) {
+                      final progress = position.inMilliseconds.clamp(0, math.max(1, _duration.inMilliseconds)).toDouble();
+                      return Column(
+                        children: [
+                          RepaintBoundary(child: StaticWaveformVisualizer(values: waveform, progress: progressMax <= 1 ? 0 : (progress / progressMax).clamp(0.0, 1.0))),
+                          const SizedBox(height: 10),
+                          SliderTheme(
+                            data: SliderTheme.of(context).copyWith(trackHeight: 3, thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 5)),
+                            child: Slider(
+                              min: 0,
+                              max: progressMax,
+                              value: progress.clamp(0, progressMax).toDouble(),
+                              activeColor: kPink,
+                              inactiveColor: Colors.white.withOpacity(.12),
+                              onChanged: _duration == Duration.zero ? null : _seek,
+                            ),
+                          ),
+                          Row(mainAxisAlignment: MainAxisAlignment.spaceBetween, children: [
+                            Text(formatVoiceDuration(position), style: const TextStyle(color: kTextSoft, fontSize: 11)),
+                            Text(formatVoiceDuration(_duration), style: const TextStyle(color: kTextSoft, fontSize: 11)),
+                          ]),
+                        ],
+                      );
+                    },
                   ),
-                  Row(mainAxisAlignment: MainAxisAlignment.spaceBetween, children: [
-                    Text(formatVoiceDuration(_position), style: const TextStyle(color: kTextSoft, fontSize: 11)),
-                    Text(formatVoiceDuration(_duration), style: const TextStyle(color: kTextSoft, fontSize: 11)),
-                  ]),
                   const SizedBox(height: 10),
                   Row(mainAxisAlignment: MainAxisAlignment.center, children: [
                     IconButton(onPressed: _previous, icon: const Icon(Icons.skip_previous_rounded, size: 36, color: Colors.white)),
@@ -1456,66 +1465,71 @@ class SmallVoiceChip extends StatelessWidget {
   );
 }
 
-class SpectrumVisualizer extends StatelessWidget {
+class StaticWaveformVisualizer extends StatelessWidget {
   final List<double> values;
-  final bool playing;
-  const SpectrumVisualizer({super.key, required this.values, required this.playing});
+  final double progress;
+  const StaticWaveformVisualizer({super.key, required this.values, required this.progress});
 
   @override
   Widget build(BuildContext context) {
-    // V9.4.2: tampilan tetap waveform bar pink-biru, tapi update FPS diturunkan dan bar count diringankan.
-    // Ini mengurangi jank tanpa mengubah layout player.
+    // V9.4.4: waveform statis; saat play hanya progress overlay yang repaint.
     return SizedBox(
       height: 98,
       width: double.infinity,
       child: CustomPaint(
-        painter: SpectrumBarPainter(values: values, playing: playing),
+        painter: StaticWaveformPainter(values: values, progress: progress),
       ),
     );
   }
 }
 
-class SpectrumBarPainter extends CustomPainter {
+class StaticWaveformPainter extends CustomPainter {
   final List<double> values;
-  final bool playing;
+  final double progress;
 
-  const SpectrumBarPainter({required this.values, required this.playing});
+  const StaticWaveformPainter({required this.values, required this.progress});
 
   @override
   void paint(Canvas canvas, Size size) {
     if (values.isEmpty || size.width <= 0 || size.height <= 0) return;
-    const gap = 3.0;
+    const gap = 2.4;
     final count = values.length;
-    final barWidth = ((size.width - gap * (count - 1)) / count).clamp(2.0, 5.0).toDouble();
+    final barWidth = ((size.width - gap * (count - 1)) / count).clamp(2.0, 3.6).toDouble();
     final totalWidth = count * barWidth + (count - 1) * gap;
     var x = (size.width - totalWidth) / 2;
     final centerY = size.height / 2;
     final paint = Paint()..style = PaintingStyle.fill;
+    final glowPaint = Paint()..maskFilter = const MaskFilter.blur(BlurStyle.normal, 3);
+    final activeX = (size.width * progress.clamp(0.0, 1.0));
 
     for (int i = 0; i < count; i++) {
       final value = values[i].clamp(.12, 1.0).toDouble();
-      final height = 14 + value * 76;
-      final color = Color.lerp(kBlue, kPink, i / math.max(1, count - 1))!.withOpacity(playing ? .94 : .52);
-      paint.color = color;
+      final height = 10 + value * 58;
+      final gradientColor = Color.lerp(kBlue, kPink, i / math.max(1, count - 1))!;
+      final isActive = x + barWidth / 2 <= activeX;
+      final color = isActive ? gradientColor.withOpacity(.96) : gradientColor.withOpacity(.34);
       final rect = Rect.fromLTWH(x, centerY - height / 2, barWidth, height);
-      canvas.drawRRect(RRect.fromRectAndRadius(rect, const Radius.circular(99)), paint);
+      final rrect = RRect.fromRectAndRadius(rect, const Radius.circular(99));
+      if (isActive) {
+        glowPaint.color = gradientColor.withOpacity(.16);
+        canvas.drawRRect(rrect, glowPaint);
+      }
+      paint.color = color;
+      canvas.drawRRect(rrect, paint);
       x += barWidth + gap;
     }
   }
 
   @override
-  bool shouldRepaint(covariant SpectrumBarPainter oldDelegate) {
-    if (oldDelegate.playing != playing) return true;
-    if (oldDelegate.values.length != values.length) return true;
-    if (!playing) return false;
-    return true;
+  bool shouldRepaint(covariant StaticWaveformPainter oldDelegate) {
+    return oldDelegate.progress != progress || !identical(oldDelegate.values, values);
   }
 }
 
 class FakeWaveform extends StatelessWidget {
   const FakeWaveform({super.key});
   @override
-  Widget build(BuildContext context) => const SpectrumVisualizer(values: [.2, .5, .8, .35, .7, .4, .9, .3, .62, .45, .75, .28], playing: false);
+  Widget build(BuildContext context) => const StaticWaveformVisualizer(values: [.2, .5, .8, .35, .7, .4, .9, .3, .62, .45, .75, .28], progress: 0);
 }
 
 class WavePainter extends CustomPainter {
@@ -2021,7 +2035,7 @@ class ProfileScreen extends StatelessWidget {
                 SettingsTile(icon: Icons.storage_rounded, title: 'Storage Mode', subtitle: 'Internal + SD DCM Waifu', trailing: Icons.chevron_right_rounded, onTap: () => Navigator.push(context, smoothPageRoute(StorageModeScreen(store: store)))),
                 SettingsTile(icon: Icons.cloud_upload_rounded, title: 'Backup & Sync', subtitle: 'Backup JSON koleksi', trailing: Icons.chevron_right_rounded, onTap: () => Navigator.push(context, smoothPageRoute(StorageModeScreen(store: store)))),
                 SettingsTile(icon: Icons.lock_rounded, title: 'App Lock', subtitle: 'Off', trailing: Icons.chevron_right_rounded),
-                SettingsTile(icon: Icons.info_rounded, title: 'About', subtitle: 'v2.0.7+37 V9.4.2 Voice Ultra Performance Patch', trailing: Icons.chevron_right_rounded),
+                SettingsTile(icon: Icons.info_rounded, title: 'About', subtitle: 'v2.0.9+39 V9.4.4 Static Waveform Performance Fix', trailing: Icons.chevron_right_rounded),
               ],
             );
           },
